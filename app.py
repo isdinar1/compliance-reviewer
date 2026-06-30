@@ -1,5 +1,4 @@
 import streamlit as st
-from groq import Groq
 from docx import Document
 from docx.shared import RGBColor, Pt
 from docx.oxml.ns import qn
@@ -27,17 +26,20 @@ st.set_page_config(
 st.title("📋 Course Compliance Reviewer")
 st.caption("Upload a course and a regulation/guidelines doc — get back a Word doc with every conflict and gap highlighted.")
 
-# ── Groq setup ────────────────────────────────────────────────────────────────
-try:
-    groq_key = st.secrets["GROQ_API_KEY"]
-except Exception:
-    groq_key = None
+# ── API key setup ─────────────────────────────────────────────────────────────
+api_key = None
+for k in ["GEMINI_API_KEY", "GROQ_API_KEY"]:
+    try:
+        val = st.secrets.get(k)
+        if val:
+            api_key = (k, val)
+            break
+    except Exception:
+        pass
 
-if not groq_key:
-    st.error("Add GROQ_API_KEY to your Streamlit secrets. Get a free key at console.groq.com")
+if not api_key:
+    st.error("No API key found. Add GEMINI_API_KEY or GROQ_API_KEY to Streamlit secrets.")
     st.stop()
-
-groq_client = Groq(api_key=groq_key)
 
 
 # ── Text extraction helpers ───────────────────────────────────────────────────
@@ -105,14 +107,34 @@ def run_review(course_text: str, regulation_text: str) -> dict:
 
 Return ONLY valid JSON:"""
 
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-        max_tokens=4000,
-    )
+    key_name, key_val = api_key
 
-    raw = response.choices[0].message.content.strip()
+    if key_name == "GEMINI_API_KEY":
+        # Direct REST call to Gemini v1 (not v1beta)
+        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={key_val}"
+        body = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4000}
+        }
+        resp = requests.post(url, json=body, timeout=60)
+        resp.raise_for_status()
+        raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+    elif key_name == "GROQ_API_KEY":
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key_val}", "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": 4000,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     json_match = re.search(r'\{.*\}', raw, re.DOTALL)
