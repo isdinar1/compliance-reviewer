@@ -81,7 +81,8 @@ Return a JSON object with this EXACT structure:
       "id": 1,
       "type": "ISSUE",
       "section": "section or topic name from the course",
-      "quote": "copy a SHORT phrase (5-15 words max) that appears VERBATIM in the course — copy it character-for-character with no changes",
+      "quote": "for ISSUE: copy a SHORT phrase (5-15 words max) VERBATIM from the course — exact characters, no changes. For GAP: null",
+      "context": "for GAP: copy a SHORT phrase (5-15 words) VERBATIM from the course near where this gap exists, so we know where to insert the annotation. For ISSUE: null",
       "explanation": "clear explanation of the conflict or gap and what the regulation requires instead",
       "regulation_ref": "specific regulation section or rule that is violated or missing"
     }
@@ -89,9 +90,9 @@ Return a JSON object with this EXACT structure:
 }
 
 Rules:
-- ISSUE = course text directly conflicts with or contradicts the regulation. MUST include a verbatim quote from the course.
-- GAP = the regulation requires something completely absent from the course. Set quote to null.
-- For ISSUE quotes: copy the SHORTEST phrase that captures the problem — 5-15 words, exact characters, no paraphrasing.
+- ISSUE = course text directly conflicts with or contradicts the regulation. MUST include a verbatim quote. Set context to null.
+- GAP = the regulation requires something completely absent from the course. Set quote to null. MUST include a context phrase (nearby verbatim text so we know where in the script to insert the gap note).
+- For ISSUE quotes and GAP context: copy the SHORTEST phrase that works — 5-15 words, exact characters, no paraphrasing.
 - Order by severity, most critical first.
 - Return ONLY valid JSON. No markdown, no extra text."""
 
@@ -214,7 +215,13 @@ def build_docx(course_text: str, result: dict) -> bytes:
         for f in findings
         if f.get("type") == "ISSUE" and f.get("quote")
     }
-    gap_sections = {f.get("section", ""): f for f in findings if f.get("type") == "GAP"}
+    # GAPs keyed by context phrase (verbatim nearby text) for positioning
+    gap_map = {
+        (f.get("context") or f.get("section") or ""): f
+        for f in findings
+        if f.get("type") == "GAP"
+    }
+    gap_sections = gap_map  # reuse variable name
 
     for line in course_text.split("\n"):
         if not line.strip():
@@ -242,12 +249,17 @@ def build_docx(course_text: str, result: dict) -> bytes:
         if not matched:
             para.add_run(remaining)
 
-        for section, finding in list(gap_sections.items()):
-            if section and section.lower() in line.lower():
+        for context_key, finding in list(gap_sections.items()):
+            if context_key:
+                start, _ = fuzzy_find(line, context_key)
+                matched_key = start >= 0 or context_key.lower() in line.lower()
+            else:
+                matched_key = False
+            if matched_key:
                 gap_para = doc.add_paragraph()
                 gr = gap_para.add_run(f"[{finding['id']}] GAP: {finding['explanation']}")
                 set_highlight(gr, "cyan")
-                del gap_sections[section]
+                del gap_sections[context_key]
 
     # Insert remaining GAPs at end of script
     for finding in gap_sections.values():
