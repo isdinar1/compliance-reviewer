@@ -111,7 +111,7 @@ Return ONLY valid JSON:"""
 
     if key_name == "GEMINI_API_KEY":
         # Direct REST call to Gemini v1 (not v1beta)
-        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.0-pro:generateContent?key={key_val}"
+        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={key_val}"
         body = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4000}
