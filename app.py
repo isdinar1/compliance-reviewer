@@ -310,8 +310,13 @@ with col2:
     )
     reg_urls = st.text_area(
         "And/or paste URLs to scan (one per line)",
-        height=100,
+        height=80,
         placeholder="https://cpr.heart.org/...\nhttps://..."
+    )
+    reg_text_input = st.text_area(
+        "Or paste a specific rule, law, or standard directly",
+        height=150,
+        placeholder="e.g. 'Does this course align with the following law? OSHA 1910.303: All electrical equipment shall be free from recognized hazards...'"
     )
 
 st.divider()
@@ -341,8 +346,11 @@ if run_btn:
             with st.spinner(f"Fetching {url}..."):
                 reg_parts.append(f"[URL: {url}]\n{extract_text_from_url(url)}")
 
+    if reg_text_input and reg_text_input.strip():
+        reg_parts.append(f"[Pasted Rule/Law]\n{reg_text_input.strip()}")
+
     if not reg_parts:
-        st.error("Please upload at least one regulation document or enter a URL.")
+        st.error("Please upload a regulation document, enter a URL, or paste a rule/law.")
         st.stop()
 
     regulation_text = "\n\n".join(reg_parts)
