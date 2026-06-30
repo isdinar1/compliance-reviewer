@@ -1,4 +1,5 @@
 import streamlit as st
+from groq import Groq
 from docx import Document
 from docx.shared import RGBColor, Pt
 from docx.oxml.ns import qn
@@ -25,6 +26,18 @@ st.set_page_config(
 
 st.title("📋 Course Compliance Reviewer")
 st.caption("Upload a course and a regulation/guidelines doc — get back a Word doc with every conflict and gap highlighted.")
+
+# ── Groq setup ────────────────────────────────────────────────────────────────
+try:
+    groq_key = st.secrets["GROQ_API_KEY"]
+except Exception:
+    groq_key = None
+
+if not groq_key:
+    st.error("Add GROQ_API_KEY to your Streamlit secrets. Get a free key at console.groq.com")
+    st.stop()
+
+groq_client = Groq(api_key=groq_key)
 
 
 # ── Text extraction helpers ───────────────────────────────────────────────────
@@ -82,70 +95,30 @@ Rules:
 
 
 def run_review(course_text: str, regulation_text: str) -> dict:
-    hf_token = None
-    try:
-        hf_token = st.secrets.get("HF_TOKEN")
-    except Exception:
-        pass
-
-    headers = {"Content-Type": "application/json"}
-    if hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
-
     prompt = f"""{SYSTEM_PROMPT}
 
 --- COURSE SCRIPT ---
-{course_text[:12000]}
+{course_text[:20000]}
 
 --- REGULATIONS / GUIDELINES ---
-{regulation_text[:12000]}
+{regulation_text[:20000]}
 
 Return ONLY valid JSON:"""
 
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": 4000,
-            "return_full_text": False,
-            "temperature": 0.1,
-        }
-    }
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+        max_tokens=4000,
+    )
 
-    # Try models in order until one works
-    models = [
-        "mistralai/Mistral-7B-Instruct-v0.3",
-        "HuggingFaceH4/zephyr-7b-beta",
-        "tiiuae/falcon-7b-instruct",
-    ]
-
-    last_error = None
-    for model_id in models:
-        try:
-            url = f"https://api-inference.huggingface.co/models/{model_id}"
-            resp = requests.post(url, headers=headers, json=payload, timeout=120)
-            if resp.status_code == 503:
-                continue
-            resp.raise_for_status()
-            result = resp.json()
-            if isinstance(result, list) and result:
-                raw = result[0].get("generated_text", "")
-            elif isinstance(result, dict):
-                raw = result.get("generated_text", str(result))
-            else:
-                raw = str(result)
-
-            # Extract JSON from response
-            raw = raw.strip()
-            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-            if json_match:
-                raw = json_match.group(0)
-
-            return json.loads(raw)
-        except Exception as e:
-            last_error = e
-            continue
-
-    raise Exception(f"All models failed. Last error: {last_error}")
+    raw = response.choices[0].message.content.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if json_match:
+        raw = json_match.group(0)
+    return json.loads(raw)
 
 
 # ── Word doc builder ──────────────────────────────────────────────────────────
