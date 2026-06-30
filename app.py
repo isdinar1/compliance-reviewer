@@ -151,36 +151,72 @@ def set_highlight(run, color: str):
     rpr.append(hl)
 
 
+def add_heading(doc, text, size=12):
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(12)
+    p.paragraph_format.space_after = Pt(4)
+    r = p.add_run(text)
+    r.bold = True
+    r.font.size = Pt(size)
+    return p
+
+
 def build_docx(course_text: str, result: dict) -> bytes:
     doc = Document()
     style = doc.styles["Normal"]
     style.font.name = "Calibri"
     style.font.size = Pt(11)
+    style.paragraph_format.space_after = Pt(4)
 
-    title_para = doc.add_paragraph()
-    run = title_para.add_run(result.get("course_title", "Course Review"))
-    run.bold = True
-    run.font.size = Pt(14)
+    # ── Header ──
+    p = doc.add_paragraph()
+    r = p.add_run(result.get("course_title", "Course Review"))
+    r.bold = True
+    r.font.size = Pt(16)
 
-    sub = doc.add_paragraph()
-    sub.add_run("Compliance Review").bold = True
-    sub.runs[0].font.size = Pt(12)
+    p = doc.add_paragraph()
+    r = p.add_run("Compliance Review")
+    r.bold = True
+    r.font.size = Pt(13)
+    r.font.color.rgb = RGBColor(0, 70, 127)
 
-    doc.add_paragraph(f"Total findings: {len(result.get('findings', []))}")
+    findings = result.get("findings", [])
+    issues = [f for f in findings if f.get("type") == "ISSUE"]
+    gaps = [f for f in findings if f.get("type") == "GAP"]
+
+    doc.add_paragraph(f"{len(issues)} issue(s) found  •  {len(gaps)} gap(s) found  •  {len(findings)} total findings")
     doc.add_paragraph(result.get("summary", ""))
 
+    # ── Legend ──
     legend = doc.add_paragraph()
-    legend.add_run("Legend:  ")
+    legend.paragraph_format.space_before = Pt(8)
+    legend.add_run("Legend:   ")
     yr = legend.add_run("  ISSUE  ")
     set_highlight(yr, "yellow")
-    legend.add_run("  = conflicts with regulation     ")
+    legend.add_run("  = conflicts with regulation        ")
     cr = legend.add_run("  GAP  ")
     set_highlight(cr, "cyan")
     legend.add_run("  = content missing from course")
 
-    doc.add_paragraph()
+    # ── Findings summary table ──
+    add_heading(doc, "FINDINGS SUMMARY", 12)
+    table = doc.add_table(rows=1, cols=3)
+    table.style = "Table Grid"
+    hdr = table.rows[0].cells
+    for cell, txt in zip(hdr, ["#", "Type", "Summary"]):
+        cell.text = txt
+        cell.paragraphs[0].runs[0].bold = True
 
-    findings = result.get("findings", [])
+    for f in findings:
+        row = table.add_row().cells
+        row[0].text = str(f.get("id", ""))
+        row[1].text = f.get("type", "")
+        row[2].text = f"{f.get('section','')}: {f.get('explanation','')[:120]}..."
+
+    # ── Full script with annotations ──
+    doc.add_page_break()
+    add_heading(doc, "FULL SCRIPT WITH ANNOTATIONS", 13)
+
     issue_map = {
         f["quote"]: f
         for f in findings
@@ -188,11 +224,12 @@ def build_docx(course_text: str, result: dict) -> bytes:
     }
     gap_sections = {f.get("section", ""): f for f in findings if f.get("type") == "GAP"}
 
-    heading = doc.add_paragraph()
-    heading.add_run("FULL SCRIPT WITH ANNOTATIONS").bold = True
-
     for line in course_text.split("\n"):
+        if not line.strip():
+            continue  # skip blank lines
+
         para = doc.add_paragraph()
+        para.paragraph_format.space_after = Pt(2)
         remaining = line
         matched = False
 
@@ -217,28 +254,36 @@ def build_docx(course_text: str, result: dict) -> bytes:
         for section, finding in list(gap_sections.items()):
             if section and section.lower() in line.lower():
                 gap_para = doc.add_paragraph()
+                gap_para.paragraph_format.space_after = Pt(4)
                 gr = gap_para.add_run(f"[{finding['id']}] GAP: {finding['explanation']}")
                 set_highlight(gr, "cyan")
                 del gap_sections[section]
 
-    for section, finding in gap_sections.items():
+    for finding in gap_sections.values():
         gap_para = doc.add_paragraph()
         gr = gap_para.add_run(f"[{finding['id']}] GAP: {finding['explanation']}")
         set_highlight(gr, "cyan")
 
+    # ── Comment legend ──
     doc.add_page_break()
-    cl = doc.add_paragraph()
-    cl.add_run("Comment Legend").bold = True
-    cl.runs[0].font.size = Pt(14)
+    add_heading(doc, "Comment Legend", 14)
 
     for f in findings:
         p = doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(8)
         color = RGBColor(192, 0, 0) if f["type"] == "ISSUE" else RGBColor(0, 70, 127)
-        label = f"[{f['id']}] {f['type']}: {f.get('section', '')} — {f['explanation']}"
-        if f.get("regulation_ref"):
-            label += f"\n    Regulation: {f['regulation_ref']}"
-        r = p.add_run(label)
+        r = p.add_run(f"[{f['id']}] {f['type']}: ")
         r.font.color.rgb = color
+        r.bold = True
+        r2 = p.add_run(f"{f.get('section', '')} — {f.get('explanation', '')}")
+        r2.font.color.rgb = color
+        if f.get("regulation_ref"):
+            p2 = doc.add_paragraph()
+            p2.paragraph_format.left_indent = Pt(20)
+            p2.paragraph_format.space_after = Pt(2)
+            r3 = p2.add_run(f"Regulation: {f['regulation_ref']}")
+            r3.font.color.rgb = RGBColor(80, 80, 80)
+            r3.italic = True
 
     buf = io.BytesIO()
     doc.save(buf)
