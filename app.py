@@ -68,11 +68,11 @@ def extract_text_from_url(url: str) -> str:
 
 
 # ── AI review via Hugging Face (no API key needed) ────────────────────────────
-SYSTEM_PROMPT = """You are a compliance analyst. You will be given a course script and regulation/guideline documents.
+SYSTEM_PROMPT = """You are a compliance analyst reviewing a course script against regulations/guidelines.
 
 Find every place where the course CONFLICTS with or is MISSING required content from the regulations.
 
-Return a JSON object with this exact structure:
+Return a JSON object with this EXACT structure:
 {
   "course_title": "inferred title or 'Untitled Course'",
   "summary": "2-3 sentence executive summary of overall compliance status",
@@ -81,19 +81,19 @@ Return a JSON object with this exact structure:
       "id": 1,
       "type": "ISSUE",
       "section": "section or topic name from the course",
-      "quote": "exact verbatim text from the course that is the problem (null for GAP type)",
-      "explanation": "clear explanation of the conflict or gap and what the regulation requires",
-      "regulation_ref": "which regulation document and what it says"
+      "quote": "copy a SHORT phrase (5-15 words max) that appears VERBATIM in the course — copy it character-for-character with no changes",
+      "explanation": "clear explanation of the conflict or gap and what the regulation requires instead",
+      "regulation_ref": "specific regulation section or rule that is violated or missing"
     }
   ]
 }
 
 Rules:
-- ISSUE = course text directly conflicts with or contradicts the regulation
-- GAP = the regulation requires something completely absent from the course
-- Be specific, cite exact quotes for ISSUEs
-- Order findings by severity (most critical first)
-- Return ONLY valid JSON, no markdown fences, no extra text"""
+- ISSUE = course text directly conflicts with or contradicts the regulation. MUST include a verbatim quote from the course.
+- GAP = the regulation requires something completely absent from the course. Set quote to null.
+- For ISSUE quotes: copy the SHORTEST phrase that captures the problem — 5-15 words, exact characters, no paraphrasing.
+- Order by severity, most critical first.
+- Return ONLY valid JSON. No markdown, no extra text."""
 
 
 def run_review(course_text: str, regulation_text: str) -> dict:
@@ -151,14 +151,25 @@ def set_highlight(run, color: str):
     rpr.append(hl)
 
 
-def add_heading(doc, text, size=12):
-    p = doc.add_paragraph()
-    p.paragraph_format.space_before = Pt(12)
-    p.paragraph_format.space_after = Pt(4)
-    r = p.add_run(text)
-    r.bold = True
-    r.font.size = Pt(size)
-    return p
+def fuzzy_find(text, quote):
+    """Find quote in text with normalized whitespace matching."""
+    if not quote:
+        return -1, -1
+    # Try exact first
+    idx = text.find(quote)
+    if idx >= 0:
+        return idx, idx + len(quote)
+    # Normalize whitespace and try again
+    norm_text = " ".join(text.split())
+    norm_quote = " ".join(quote.split())
+    idx = norm_text.find(norm_quote)
+    if idx >= 0:
+        # Map back to original text position approximately
+        start = text.lower().find(norm_quote[:20].lower())
+        if start >= 0:
+            end = start + len(norm_quote)
+            return start, min(end, len(text))
+    return -1, -1
 
 
 def build_docx(course_text: str, result: dict) -> bytes:
@@ -166,56 +177,37 @@ def build_docx(course_text: str, result: dict) -> bytes:
     style = doc.styles["Normal"]
     style.font.name = "Calibri"
     style.font.size = Pt(11)
-    style.paragraph_format.space_after = Pt(4)
+
+    findings = result.get("findings", [])
 
     # ── Header ──
     p = doc.add_paragraph()
     r = p.add_run(result.get("course_title", "Course Review"))
     r.bold = True
-    r.font.size = Pt(16)
+    r.font.size = Pt(14)
 
     p = doc.add_paragraph()
     r = p.add_run("Compliance Review")
     r.bold = True
-    r.font.size = Pt(13)
-    r.font.color.rgb = RGBColor(0, 70, 127)
+    r.font.size = Pt(12)
 
-    findings = result.get("findings", [])
-    issues = [f for f in findings if f.get("type") == "ISSUE"]
-    gaps = [f for f in findings if f.get("type") == "GAP"]
-
-    doc.add_paragraph(f"{len(issues)} issue(s) found  •  {len(gaps)} gap(s) found  •  {len(findings)} total findings")
-    doc.add_paragraph(result.get("summary", ""))
+    p = doc.add_paragraph(result.get("summary", ""))
 
     # ── Legend ──
     legend = doc.add_paragraph()
-    legend.paragraph_format.space_before = Pt(8)
-    legend.add_run("Legend:   ")
+    legend.add_run("Legend:  ")
     yr = legend.add_run("  ISSUE  ")
     set_highlight(yr, "yellow")
-    legend.add_run("  = conflicts with regulation        ")
+    legend.add_run("  = conflicts with regulation     ")
     cr = legend.add_run("  GAP  ")
     set_highlight(cr, "cyan")
-    legend.add_run("  = content missing from course")
+    legend.add_run("  = content missing from course     [n] = comment number")
 
-    # ── Findings summary table ──
-    add_heading(doc, "FINDINGS SUMMARY", 12)
-    table = doc.add_table(rows=1, cols=3)
-    table.style = "Table Grid"
-    hdr = table.rows[0].cells
-    for cell, txt in zip(hdr, ["#", "Type", "Summary"]):
-        cell.text = txt
-        cell.paragraphs[0].runs[0].bold = True
-
-    for f in findings:
-        row = table.add_row().cells
-        row[0].text = str(f.get("id", ""))
-        row[1].text = f.get("type", "")
-        row[2].text = f"{f.get('section','')}: {f.get('explanation','')[:120]}..."
+    doc.add_paragraph()
 
     # ── Full script with annotations ──
-    doc.add_page_break()
-    add_heading(doc, "FULL SCRIPT WITH ANNOTATIONS", 13)
+    heading = doc.add_paragraph()
+    heading.add_run("FULL SCRIPT WITH ANNOTATIONS").bold = True
 
     issue_map = {
         f["quote"]: f
@@ -226,25 +218,24 @@ def build_docx(course_text: str, result: dict) -> bytes:
 
     for line in course_text.split("\n"):
         if not line.strip():
-            continue  # skip blank lines
+            continue
 
         para = doc.add_paragraph()
-        para.paragraph_format.space_after = Pt(2)
         remaining = line
         matched = False
 
         for quote, finding in issue_map.items():
-            if quote in remaining:
-                before, _, after = remaining.partition(quote)
-                if before:
-                    para.add_run(before)
-                yr = para.add_run(quote)
+            start, end = fuzzy_find(remaining, quote)
+            if start >= 0:
+                if start > 0:
+                    para.add_run(remaining[:start])
+                yr = para.add_run(remaining[start:end])
                 set_highlight(yr, "yellow")
                 marker = para.add_run(f" [{finding['id']}]")
                 marker.font.color.rgb = RGBColor(192, 0, 0)
                 marker.bold = True
-                if after:
-                    para.add_run(after)
+                if end < len(remaining):
+                    para.add_run(remaining[end:])
                 matched = True
                 break
 
@@ -254,36 +245,31 @@ def build_docx(course_text: str, result: dict) -> bytes:
         for section, finding in list(gap_sections.items()):
             if section and section.lower() in line.lower():
                 gap_para = doc.add_paragraph()
-                gap_para.paragraph_format.space_after = Pt(4)
                 gr = gap_para.add_run(f"[{finding['id']}] GAP: {finding['explanation']}")
                 set_highlight(gr, "cyan")
                 del gap_sections[section]
 
+    # Insert remaining GAPs at end of script
     for finding in gap_sections.values():
         gap_para = doc.add_paragraph()
         gr = gap_para.add_run(f"[{finding['id']}] GAP: {finding['explanation']}")
         set_highlight(gr, "cyan")
 
-    # ── Comment legend ──
+    # ── Comment Legend ──
     doc.add_page_break()
-    add_heading(doc, "Comment Legend", 14)
+    cl = doc.add_paragraph()
+    cl.add_run("Comment Legend").bold = True
+    cl.runs[0].font.size = Pt(14)
 
     for f in findings:
         p = doc.add_paragraph()
-        p.paragraph_format.space_after = Pt(8)
+        p.paragraph_format.space_after = Pt(6)
         color = RGBColor(192, 0, 0) if f["type"] == "ISSUE" else RGBColor(0, 70, 127)
-        r = p.add_run(f"[{f['id']}] {f['type']}: ")
-        r.font.color.rgb = color
-        r.bold = True
-        r2 = p.add_run(f"{f.get('section', '')} — {f.get('explanation', '')}")
-        r2.font.color.rgb = color
+        label = f"[{f['id']}] {f['type']}: {f.get('section', '')} — {f.get('explanation', '')}"
         if f.get("regulation_ref"):
-            p2 = doc.add_paragraph()
-            p2.paragraph_format.left_indent = Pt(20)
-            p2.paragraph_format.space_after = Pt(2)
-            r3 = p2.add_run(f"Regulation: {f['regulation_ref']}")
-            r3.font.color.rgb = RGBColor(80, 80, 80)
-            r3.italic = True
+            label += f"\n    Regulation: {f['regulation_ref']}"
+        r = p.add_run(label)
+        r.font.color.rgb = color
 
     buf = io.BytesIO()
     doc.save(buf)
