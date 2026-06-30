@@ -1,5 +1,4 @@
 import streamlit as st
-from google import genai as google_genai
 from docx import Document
 from docx.shared import RGBColor, Pt
 from docx.oxml.ns import qn
@@ -16,12 +15,6 @@ try:
 except ImportError:
     HAS_PYPDF = False
 
-try:
-    from docx import Document as DocxDocument
-    HAS_DOCX = True
-except ImportError:
-    HAS_DOCX = False
-
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -32,18 +25,6 @@ st.set_page_config(
 
 st.title("📋 Course Compliance Reviewer")
 st.caption("Upload a course and a regulation/guidelines doc — get back a Word doc with every conflict and gap highlighted.")
-
-# ── Gemini setup ─────────────────────────────────────────────────────────────
-try:
-    api_key = st.secrets["GEMINI_API_KEY"]
-except Exception:
-    api_key = None
-
-if not api_key:
-    st.error("Gemini API key not configured. Add GEMINI_API_KEY to your Streamlit secrets.")
-    st.stop()
-
-client = google_genai.Client(api_key=api_key)
 
 
 # ── Text extraction helpers ───────────────────────────────────────────────────
@@ -71,12 +52,10 @@ def extract_text_from_url(url: str) -> str:
         return f"[Could not fetch {url}: {e}]"
 
 
-# ── Gemini review ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are a compliance analyst. You will be given:
-1. A course script (training content)
-2. One or more regulation/guideline documents
+# ── AI review via Hugging Face (no API key needed) ────────────────────────────
+SYSTEM_PROMPT = """You are a compliance analyst. You will be given a course script and regulation/guideline documents.
 
-Your job: find every place where the course CONFLICTS with or is MISSING required content from the regulations.
+Find every place where the course CONFLICTS with or is MISSING required content from the regulations.
 
 Return a JSON object with this exact structure:
 {
@@ -87,8 +66,8 @@ Return a JSON object with this exact structure:
       "id": 1,
       "type": "ISSUE",
       "section": "section or topic name from the course",
-      "quote": "exact verbatim text from the course that is the problem (for ISSUE only, null for GAP)",
-      "explanation": "clear explanation of the conflict or gap and what the regulation requires instead",
+      "quote": "exact verbatim text from the course that is the problem (null for GAP type)",
+      "explanation": "clear explanation of the conflict or gap and what the regulation requires",
       "regulation_ref": "which regulation document and what it says"
     }
   ]
@@ -96,29 +75,77 @@ Return a JSON object with this exact structure:
 
 Rules:
 - ISSUE = course text directly conflicts with or contradicts the regulation
-- GAP = the regulation requires something that is completely absent from the course
-- Be specific and cite exact quotes where possible
+- GAP = the regulation requires something completely absent from the course
+- Be specific, cite exact quotes for ISSUEs
 - Order findings by severity (most critical first)
-- Return ONLY valid JSON, no markdown fences"""
+- Return ONLY valid JSON, no markdown fences, no extra text"""
 
 
 def run_review(course_text: str, regulation_text: str) -> dict:
+    hf_token = None
+    try:
+        hf_token = st.secrets.get("HF_TOKEN")
+    except Exception:
+        pass
+
+    headers = {"Content-Type": "application/json"}
+    if hf_token:
+        headers["Authorization"] = f"Bearer {hf_token}"
+
     prompt = f"""{SYSTEM_PROMPT}
 
 --- COURSE SCRIPT ---
-{course_text[:30000]}
+{course_text[:12000]}
 
 --- REGULATIONS / GUIDELINES ---
-{regulation_text[:30000]}"""
+{regulation_text[:12000]}
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash-lite",
-        contents=prompt
-    )
-    raw = response.text.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    return json.loads(raw)
+Return ONLY valid JSON:"""
+
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": 4000,
+            "return_full_text": False,
+            "temperature": 0.1,
+        }
+    }
+
+    # Try models in order until one works
+    models = [
+        "mistralai/Mistral-7B-Instruct-v0.3",
+        "HuggingFaceH4/zephyr-7b-beta",
+        "tiiuae/falcon-7b-instruct",
+    ]
+
+    last_error = None
+    for model_id in models:
+        try:
+            url = f"https://api-inference.huggingface.co/models/{model_id}"
+            resp = requests.post(url, headers=headers, json=payload, timeout=120)
+            if resp.status_code == 503:
+                continue
+            resp.raise_for_status()
+            result = resp.json()
+            if isinstance(result, list) and result:
+                raw = result[0].get("generated_text", "")
+            elif isinstance(result, dict):
+                raw = result.get("generated_text", str(result))
+            else:
+                raw = str(result)
+
+            # Extract JSON from response
+            raw = raw.strip()
+            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if json_match:
+                raw = json_match.group(0)
+
+            return json.loads(raw)
+        except Exception as e:
+            last_error = e
+            continue
+
+    raise Exception(f"All models failed. Last error: {last_error}")
 
 
 # ── Word doc builder ──────────────────────────────────────────────────────────
@@ -135,7 +162,6 @@ def build_docx(course_text: str, result: dict) -> bytes:
     style.font.name = "Calibri"
     style.font.size = Pt(11)
 
-    # Header
     title_para = doc.add_paragraph()
     run = title_para.add_run(result.get("course_title", "Course Review"))
     run.bold = True
@@ -148,7 +174,6 @@ def build_docx(course_text: str, result: dict) -> bytes:
     doc.add_paragraph(f"Total findings: {len(result.get('findings', []))}")
     doc.add_paragraph(result.get("summary", ""))
 
-    # Legend
     legend = doc.add_paragraph()
     legend.add_run("Legend:  ")
     yr = legend.add_run("  ISSUE  ")
@@ -160,26 +185,22 @@ def build_docx(course_text: str, result: dict) -> bytes:
 
     doc.add_paragraph()
 
-    # Build a quick lookup: quote → finding id
     findings = result.get("findings", [])
     issue_map = {
         f["quote"]: f
         for f in findings
         if f.get("type") == "ISSUE" and f.get("quote")
     }
+    gap_sections = {f.get("section", ""): f for f in findings if f.get("type") == "GAP"}
 
-    # Full course script with highlights
     heading = doc.add_paragraph()
     heading.add_run("FULL SCRIPT WITH ANNOTATIONS").bold = True
-
-    gap_sections = {f.get("section", ""): f for f in findings if f.get("type") == "GAP"}
 
     for line in course_text.split("\n"):
         para = doc.add_paragraph()
         remaining = line
-
-        # Check for ISSUE quotes in this line
         matched = False
+
         for quote, finding in issue_map.items():
             if quote in remaining:
                 before, _, after = remaining.partition(quote)
@@ -198,25 +219,18 @@ def build_docx(course_text: str, result: dict) -> bytes:
         if not matched:
             para.add_run(remaining)
 
-        # Insert GAP annotations after relevant sections
         for section, finding in list(gap_sections.items()):
             if section and section.lower() in line.lower():
                 gap_para = doc.add_paragraph()
-                gr = gap_para.add_run(
-                    f"[{finding['id']}] GAP: {finding['explanation']}"
-                )
+                gr = gap_para.add_run(f"[{finding['id']}] GAP: {finding['explanation']}")
                 set_highlight(gr, "cyan")
                 del gap_sections[section]
 
-    # Insert any remaining GAPs at end
     for section, finding in gap_sections.items():
         gap_para = doc.add_paragraph()
-        gr = gap_para.add_run(
-            f"[{finding['id']}] GAP: {finding['explanation']}"
-        )
+        gr = gap_para.add_run(f"[{finding['id']}] GAP: {finding['explanation']}")
         set_highlight(gr, "cyan")
 
-    # Comment Legend page
     doc.add_page_break()
     cl = doc.add_paragraph()
     cl.add_run("Comment Legend").bold = True
@@ -266,7 +280,6 @@ st.divider()
 run_btn = st.button("🔍 Run Compliance Review", type="primary", use_container_width=True)
 
 if run_btn:
-    # Gather course text
     course_text = ""
     if course_file:
         course_text = extract_text_from_file(course_file)
@@ -280,7 +293,6 @@ if run_btn:
     if course_sku:
         course_text = f"Course SKU: {course_sku}\n\n{course_text}"
 
-    # Gather regulation text
     reg_parts = []
     for rf in (reg_files or []):
         reg_parts.append(f"[Document: {rf.name}]\n{extract_text_from_file(rf)}")
@@ -297,7 +309,7 @@ if run_btn:
 
     regulation_text = "\n\n".join(reg_parts)
 
-    with st.spinner("Reviewing with AI — this takes 15–30 seconds..."):
+    with st.spinner("Reviewing — this takes 30–60 seconds..."):
         try:
             result = run_review(course_text, regulation_text)
         except Exception as e:
