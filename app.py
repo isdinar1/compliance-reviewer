@@ -1,5 +1,5 @@
 import streamlit as st
-import google.generativeai as genai
+from google import genai as google_genai
 from docx import Document
 from docx.shared import RGBColor, Pt
 from docx.oxml.ns import qn
@@ -43,8 +43,7 @@ if not api_key:
     st.error("Gemini API key not configured. Add GEMINI_API_KEY to your Streamlit secrets.")
     st.stop()
 
-genai.configure(api_key=api_key)
-model = genai.GenerativeModel("gemini-1.5-flash-8b")
+client = google_genai.Client(api_key=api_key)
 
 
 # ── Text extraction helpers ───────────────────────────────────────────────────
@@ -112,7 +111,10 @@ def run_review(course_text: str, regulation_text: str) -> dict:
 --- REGULATIONS / GUIDELINES ---
 {regulation_text[:30000]}"""
 
-    response = model.generate_content(prompt)
+    response = client.models.generate_content(
+        model="gemini-2.0-flash-lite",
+        contents=prompt
+    )
     raw = response.text.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
